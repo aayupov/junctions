@@ -252,14 +252,18 @@ class HastiXbar(nMasters: Int, addressMap: Seq[UInt=>Bool])(implicit p: Paramete
       Vec.tabulate(nSlaves) { s => dataPhaseGrantSM(s)(m) && !matchMS(m)(s) }
       .reduce(_ || _) }
   
+  // Block any request that requires bus ownership or conflicts with isLocked
+  val blockedM = 
+    Vec((lockedM zip masters) map { case(l, m) => !l && (isLocked || m.hmastlock) })
+  
   // Requested access to slaves from masters (pre-arbitration)
-  // NOTE: quash any request that requires bus ownership or conflicts with isLocked
   // NOTE: isNSeq does NOT include SEQ; thus, masters who are midburst do not
   // request access to a new slave. They stay tied to the old and do not get two.
   // NOTE: if a master was waited, it must repeat the same request as last cycle;
   // thus, it will request the same slave and not end up with two (unless buggy).
-  val NSeq = Vec((lockedM zip masters) map { case(l, m) => m.isNSeq() && ((!isLocked && !m.hmastlock) || l) })
-  val requestSM = Vec.tabulate(nSlaves) { s => Vec.tabulate(nMasters) { m => matchMS(m)(s) && NSeq(m) && !bubbleM(m) } }
+  val NSeq = masters.map(_.isNSeq())
+  val requestSM = Vec.tabulate(nSlaves) { s => Vec.tabulate(nMasters) { m => 
+    matchMS(m)(s) && NSeq(m) && !bubbleM(m) && !blockedM(m) } }
   
   // Select at most one master request per slave (lowest index = highest priority)
   val selectedRequestSM = Vec(requestSM map { m => Vec(PriorityEncoderOH(m)) })
@@ -268,28 +272,26 @@ class HastiXbar(nMasters: Int, addressMap: Seq[UInt=>Bool])(implicit p: Paramete
   addressPhaseGrantSM := Vec((holdS zip (priorAddressPhaseGrantSM zip selectedRequestSM))
                              map { case (h, (p, r)) => Mux(h, p, r) })
 
-  // If we diverted a master, we need to absorb his address phase to replay later
   for (m <- 0 until nMasters) {
-    diversions(m).io.divert := bubbleM(m) && NSeq(m) && masters(m).hready
-  }
-  
-  def dotProduct(g: Seq[Bool], v: Seq[UInt]) =
-    (g zip v) map { case (gg, ss) => Mux(gg, ss, ss.fromBits(UInt(0))) } reduce (_|_)
-
-  // Master muxes (address and data phase are the same)
-  (masters zip (unionGrantMS zip nowhereM)) foreach { case (m, (g, n)) => {
     // If the master is connected to a slave, the slave determines hready.
     // However, if no slave is connected, for progress report ready anyway, if:
-    //   bad address (swallow request) OR idle (permit stupid slaves to move FSM)
-    val autoready = n || m.isIdle()
-    m.hready := dotProduct(g, slaves.map(_.hready ^ autoready)) ^ autoready
+    //   bad address (swallow request) OR idle (permit stupid masters to move FSM)
+    val autoready = nowhereM(m) || masters(m).isIdle()
+    val hready = Mux1H(unionGrantMS(m), slaves.map(_.hready ^ autoready)) ^ autoready
+    masters(m).hready := hready
+    // If we diverted a master, we need to absorb his address phase to replay later
+    diversions(m).io.divert := (bubbleM(m) || blockedM(m)) && NSeq(m) && hready
+  }
+  
+  // Master muxes (address and data phase are the same)
+  (masters zip unionGrantMS) foreach { case (m, g) => {
     m.hrdata := Mux1H(g, slaves.map(_.hrdata))
     m.hresp  := Mux1H(g, slaves.map(_.hresp))
   } }
   
   // Slave address phase muxes
   (slaves zip addressPhaseGrantSM) foreach { case (s, g) => {
-    s.htrans    := dotProduct(g, masters.map(_.htrans)) // defaults to HTRANS_IDLE (0)
+    s.htrans    := Mux1H(g, masters.map(_.htrans))
     s.haddr     := Mux1H(g, masters.map(_.haddr))
     s.hmastlock := isLocked
     s.hwrite    := Mux1H(g, masters.map(_.hwrite))
@@ -474,7 +476,7 @@ class HastiTestSRAM(depth: Int)(implicit p: Parameters) extends HastiModule()(p)
   // The mask and address during the address phase
   val a_request   = io.hsel && (io.htrans === HTRANS_NONSEQ || io.htrans === HTRANS_SEQ)
   val a_mask      = Wire(UInt(width = hastiDataBytes))
-  val a_address   = io.haddr >> UInt(hastiAlignment)
+  val a_address   = io.haddr(depth-1, hastiAlignment)
   val a_write     = io.hwrite
 
   // for backwards compatibility with chisel2, we needed a static width in definition
@@ -507,7 +509,7 @@ class HastiTestSRAM(depth: Int)(implicit p: Parameters) extends HastiModule()(p)
   val p_wdata     = holdUnless(d_wdata, p_latch_d)
   
   // Use single-ported memory with byte-write enable
-  val mem = SeqMem(depth, Vec(hastiDataBytes, Bits(width = 8)))
+  val mem = SeqMem(1 << (depth-hastiAlignment), Vec(hastiDataBytes, Bits(width = 8)))
   
   // Decide is the SRAM port is used for reading or (potentially) writing
   val read = ready && a_request && !a_write

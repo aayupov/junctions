@@ -71,6 +71,17 @@ trait HasNastiData extends HasNastiParameters {
   val last = Bool()
 }
 
+class NastiReadIO(implicit val p: Parameters) extends ParameterizedBundle()(p) {
+  val ar = Decoupled(new NastiReadAddressChannel)
+  val r  = Decoupled(new NastiReadDataChannel).flip
+}
+
+class NastiWriteIO(implicit val p: Parameters) extends ParameterizedBundle()(p) {
+  val aw = Decoupled(new NastiWriteAddressChannel)
+  val w  = Decoupled(new NastiWriteDataChannel)
+  val b  = Decoupled(new NastiWriteResponseChannel).flip
+}
+
 class NastiIO(implicit val p: Parameters) extends ParameterizedBundle()(p) {
   val aw = Decoupled(new NastiWriteAddressChannel)
   val w  = Decoupled(new NastiWriteDataChannel)
@@ -168,19 +179,15 @@ object NastiReadAddressChannel {
 }
 
 object NastiWriteDataChannel {
-  def apply(data: UInt, last: Bool = Bool(true), id: UInt = UInt(0))
+  def apply(data: UInt, strb: Option[UInt] = None,
+            last: Bool = Bool(true), id: UInt = UInt(0))
            (implicit p: Parameters): NastiWriteDataChannel = {
     val w = Wire(new NastiWriteDataChannel)
-    w.strb := Fill(w.nastiWStrobeBits, UInt(1, 1))
+    w.strb := strb.getOrElse(Fill(w.nastiWStrobeBits, UInt(1, 1)))
     w.data := data
     w.last := last
+    w.id   := id
     w.user := UInt(0)
-    w
-  }
-  def apply(data: UInt, strb: UInt, last: Bool, id: UInt)
-           (implicit p: Parameters): NastiWriteDataChannel = {
-    val w = apply(data, last, id)
-    w.strb := strb
     w
   }
 }
