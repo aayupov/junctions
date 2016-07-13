@@ -10,6 +10,86 @@ class Crossing[T <: Data](gen: T, enq_sync: Boolean, deq_sync: Boolean) extends 
     val deq_reset = if (deq_sync) Some(Bool(INPUT))  else None
 }
 
+object GrayCounter {
+  def apply(bits: Int, increment: Bool = Bool(true)): UInt = {
+    val binary = RegInit(UInt(0, width = bits))
+    val incremented = binary + increment.asUInt()
+    binary := incremented
+    incremented ^ (incremented >> UInt(1))
+  }
+}
+
+object AsyncGrayCounter {
+  def apply(in: UInt, sync: Int): UInt = {
+    val syncv = RegInit(Vec.fill(sync){UInt(0, width = in.width)})
+    syncv.last := in
+    (syncv.init zip syncv.tail).foreach { case (sink, source) => sink := source }
+    syncv(0)
+  }
+}
+
+class AsyncQueueSource[T <: Data](gen: T, depth: Int, sync: Int, clock: Clock, reset: Bool)
+    extends Module(_clock = clock, _reset = reset) {
+  val io = new Bundle {
+    // These come from the source domain
+    val enq  = Decoupled(gen.cloneType).flip()
+    // These cross to the sink clock domain
+    val ridx = UInt(INPUT,  width = depth+1)
+    val widx = UInt(OUTPUT, width = depth+1)
+  }
+
+  val widx = GrayCounter(depth+1, io.enq.fire())
+  val ridx = AsyncGrayCounter(io.ridx, sync)
+  val start = ridx ^ (UInt(1) << UInt(depth))
+
+  io.enq.ready := RegNext(widx =/= start)
+  io.widx := RegNext(widx)
+}
+
+class AsyncQueueSink[T <: Data](gen: T, depth: Int, sync: Int, clock: Clock, reset: Bool)
+    extends Module(_clock = clock, _reset = reset) {
+  val io = new Bundle {
+    // These come from the sink domain
+    val deq  = Decoupled(gen.cloneType)
+    // These cross to the source clock domain
+    val ridx = UInt(OUTPUT, width = depth+1)
+    val widx = UInt(INPUT,  width = depth+1)
+    // These go to the SeqMem
+    val addr = UInt(OUTPUT, width = depth+1)
+  }
+
+  val ridx = GrayCounter(depth+1, io.deq.fire())
+  val widx = AsyncGrayCounter(io.widx, sync)
+  val end = widx
+
+  io.deq.valid := RegNext(ridx =/= end)
+  io.ridx := RegNext(ridx)
+
+  // async address, because the register is inside the SeqMem
+  io.addr := ridx
+}
+
+class AsyncQueue[T <: Data](gen: T, depth: Int, sync: Int = 2) extends Module {
+  val io = new Crossing(gen, true, true)
+  require (sync >= 2)
+
+  val none = Vec(0, Bool(OUTPUT))
+  val source = Module(new AsyncQueueSource(none, depth, sync, io.enq_clock.get, io.enq_reset.get))
+  val sink   = Module(new AsyncQueueSink  (none, depth, sync, io.deq_clock.get, io.deq_reset.get))
+
+  source.io.enq.valid := io.enq.valid
+  io.enq.ready := source.io.enq.ready
+  sink.io.deq.ready := io.deq.ready
+  io.deq.valid := sink.io.deq.ready
+
+  sink.io.widx := source.io.widx
+  source.io.ridx := sink.io.ridx
+
+  val mem = SeqMem(1 << depth, gen)
+  when (io.enq.fire()) { mem.writeOnClock(source.io.widx(depth-1, 0), io.enq.bits, io.enq_clock.get) }
+  io.deq.bits := mem.readOnClock(sink.io.addr(depth-1, 0), io.deq_clock.get)
+}
+
 // Output is 1 for one cycle after any edge of 'in'
 object AsyncHandshakePulse {
   def apply(in: Bool, sync: Int): Bool = {
@@ -104,8 +184,12 @@ class AsyncHandshake[T <: Data](gen: T, sync: Int = 2) extends Module {
 class AsyncDecoupledTo[T <: Data](gen: T, depth: Int = 0, sync: Int = 2) extends Module {
   val io = new Crossing(gen, false, true)
 
-  // !!! if depth == 0 { use Handshake } else { use AsyncFIFO }
-  val crossing = Module(new AsyncHandshake(gen, sync)).io
+  val crossing = if (depth == 0) {
+    Module(new AsyncHandshake(gen, sync)).io
+  } else {
+    Module(new AsyncQueue(gen, depth, sync)).io
+  }
+
   crossing.enq_clock.get := clock
   crossing.enq_reset.get := reset
   crossing.enq <> io.enq
@@ -128,8 +212,12 @@ object AsyncDecoupledTo {
 class AsyncDecoupledFrom[T <: Data](gen: T, depth: Int = 0, sync: Int = 2) extends Module {
   val io = new Crossing(gen, true, false)
 
-  // !!! if depth == 0 { use Handshake } else { use AsyncFIFO }
-  val crossing = Module(new AsyncHandshake(gen, sync)).io
+  val crossing = if (depth == 0) {
+    Module(new AsyncHandshake(gen, sync)).io
+  } else {
+    Module(new AsyncQueue(gen, depth, sync)).io
+  }
+
   crossing.enq_clock.get := io.enq_clock.get
   crossing.enq_reset.get := io.enq_reset.get
   crossing.enq <> io.enq
